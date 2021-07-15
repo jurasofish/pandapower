@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 
-# Copyright (c) 2016-2020 by University of Kassel and Fraunhofer Institute for Energy Economics
+# Copyright (c) 2016-2021 by University of Kassel and Fraunhofer Institute for Energy Economics
 # and Energy System Technology (IEE), Kassel. All rights reserved.
 
 
 import numpy as np
 
 from pandapower.pf.ppci_variables import bustypes
-from pandapower.pypower.idx_bus import PV, REF, VA, VM, BUS_TYPE, NONE, VMAX, VMIN
-from pandapower.pypower.idx_gen import QMIN, QMAX, PMIN, PMAX, GEN_BUS, PG, VG, QG, MBASE, CON_FAC
-from pandapower.auxiliary import _subnetworks
+from pandapower.pypower.idx_bus import PV, REF, VA, VM, BUS_TYPE, NONE, VMAX, VMIN, SL_FAC as SL_FAC_BUS
+from pandapower.pypower.idx_gen import QMIN, QMAX, PMIN, PMAX, GEN_BUS, PG, VG, QG, MBASE, SL_FAC
+from pandapower.auxiliary import _subnetworks, _sum_by_group
 
 try:
     import pplog as logging
@@ -107,17 +107,28 @@ def _build_pp_ext_grid(net, ppc, f, t):
     eg_buses = bus_lookup[net["ext_grid"]["bus"].values[eg_is]]
     ppc["gen"][f:t, GEN_BUS] = eg_buses
     ppc["gen"][f:t, VG] = net["ext_grid"]["vm_pu"].values[eg_is]
-    ppc["gen"][f:t, CON_FAC] = net["ext_grid"]["contribution_factor"].values[eg_is]
+    ppc["gen"][f:t, SL_FAC] = net["ext_grid"]["slack_weight"].values[eg_is]
 
     # set bus values for external grid buses
-    if calculate_voltage_angles:
-        ppc["bus"][eg_buses, VA] = net["ext_grid"]["va_degree"].values[eg_is]
-    ppc["bus"][eg_buses, VM] = net["ext_grid"]["vm_pu"].values[eg_is]
+    if ppc.get("sequence", 1) == 1:
+        if calculate_voltage_angles:
+            ppc["bus"][eg_buses, VA] = net["ext_grid"]["va_degree"].values[eg_is]
+        ppc["bus"][eg_buses, VM] = net["ext_grid"]["vm_pu"].values[eg_is]
     if net._options["mode"] == "opf":
         add_q_constraints(net, "ext_grid", eg_is, ppc, f, t, delta)
         add_p_constraints(net, "ext_grid", eg_is, ppc, f, t, delta)
-        ppc["bus"][eg_buses, VMAX] = net["ext_grid"]["vm_pu"].values[eg_is] + delta
-        ppc["bus"][eg_buses, VMIN] = net["ext_grid"]["vm_pu"].values[eg_is] - delta
+
+        if "controllable" in net["ext_grid"]:
+            #     if we do and one of them is false, do this only for the ones, where it is false
+            eg_constrained = net.ext_grid[eg_is][net.ext_grid.controllable == False]
+            if len(eg_constrained):
+                eg_constrained_bus = eg_constrained.bus
+                ppc["bus"][eg_constrained_bus, VMAX] = net["ext_grid"]["vm_pu"].values[eg_constrained.index] + delta
+                ppc["bus"][eg_constrained_bus, VMIN] = net["ext_grid"]["vm_pu"].values[eg_constrained.index] - delta
+        else:
+            # if we dont:
+            ppc["bus"][eg_buses, VMAX] = net["ext_grid"]["vm_pu"].values[eg_is] + delta
+            ppc["bus"][eg_buses, VMIN] = net["ext_grid"]["vm_pu"].values[eg_is] - delta
     else:
         ppc["gen"][f:t, QMIN] = 0
         ppc["gen"][f:t, QMAX] = 0
@@ -196,7 +207,7 @@ def _build_pp_gen(net, ppc, f, t):
     ppc["gen"][f:t, GEN_BUS] = gen_buses
     ppc["gen"][f:t, PG] = (net["gen"]["p_mw"].values[gen_is] * net["gen"]["scaling"].values[gen_is])
     ppc["gen"][f:t, MBASE] = net["gen"]["sn_mva"].values[gen_is]
-    ppc["gen"][f:t, CON_FAC] = net["gen"]["contribution_factor"].values[gen_is]
+    ppc["gen"][f:t, SL_FAC] = net["gen"]["slack_weight"].values[gen_is]
     ppc["gen"][f:t, VG] = gen_is_vm
 
     # set bus values for generator buses
@@ -221,8 +232,9 @@ def _build_pp_xward(net, ppc, f, t, update_lookup=True):
     xw_is = net["_is_elements"]['xward']
     ppc["gen"][f:t, GEN_BUS] = bus_lookup[aux_buses[xw_is]]
     ppc["gen"][f:t, VG] = xw["vm_pu"][xw_is].values
-    ppc["gen"][f:t, PMIN] = + delta
-    ppc["gen"][f:t, PMAX] = - delta
+    ppc["gen"][f:t, SL_FAC] = net["xward"]["slack_weight"].values[xw_is]
+    ppc["gen"][f:t, PMIN] = - delta
+    ppc["gen"][f:t, PMAX] = + delta
     ppc["gen"][f:t, QMIN] = -q_lim_default
     ppc["gen"][f:t, QMAX] = q_lim_default
 
@@ -328,12 +340,32 @@ def _normalise_slack_weights(ppc):
     """ Unitise the slack contribution factors in each island to sum to 1. """
     subnets = _subnetworks(ppc)
     gen_buses = ppc['gen'][:, GEN_BUS].astype(np.int32)
+    slack_weights_gen = ppc['gen'][:, SL_FAC].astype(np.float64)
+
+    # only 1 ext_grid (reference bus) supported and all others are considered as PV buses,
+    # 1 ext_grid is used as slack and others are converted to PV nodes internally;
+    # calculate dist_slack for all SL and PV nodes that have non-zero slack weight:
+    buses_with_slack_weights = ppc['gen'][ppc['gen'][:, SL_FAC] != 0, GEN_BUS].astype(np.int32)
+    if np.sum(ppc['bus'][buses_with_slack_weights, BUS_TYPE] == REF) > 1:
+        logger.warning("Distributed slack calculation is implemented only for one reference type bus, "
+                       "other reference buses will be converted to PV buses internally. "
+                       "All distributed slack elements that have a non-zero contribution factor will be considered. "
+                       "Extended ward (xward) elements are not supported as distributed slack elements")
+
     for subnet in subnets:
         subnet_gen_mask = np.isin(gen_buses, subnet)
-        sum_dist_weights = np.sum(ppc['gen'][subnet_gen_mask, CON_FAC])
-        if np.isclose(sum_dist_weights, 0):
-            # ppc['gen'][subnet_gen_mask, CON_FAC] = 0
+        sum_slack_weights = np.sum(slack_weights_gen[subnet_gen_mask])
+        if np.isclose(sum_slack_weights, 0):
+            # ppc['gen'][subnet_gen_mask, SL_FAC] = 0
             raise ValueError('Distributed slack contribution factors in an '
                              'island sum to zero.')
         else:
-            ppc['gen'][subnet_gen_mask, CON_FAC] /= sum_dist_weights
+            # ppc['gen'][subnet_gen_mask, SL_FAC] /= sum_slack_weights
+            slack_weights_gen /= sum_slack_weights
+            buses, slack_weights_bus, _ = _sum_by_group(gen_buses[subnet_gen_mask], slack_weights_gen[subnet_gen_mask], slack_weights_gen[subnet_gen_mask])
+            ppc['bus'][buses, SL_FAC_BUS] = slack_weights_bus
+
+    # raise NotImplementedError if there are several separate zones for distributed slack:
+    if not np.isclose(sum(ppc['bus'][:, SL_FAC_BUS]), 1):
+        raise NotImplementedError("Distributed slack calculation is not implemented for several separate zones at once, "
+                                  "please calculate the zones separately.")

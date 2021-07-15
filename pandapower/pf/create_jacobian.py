@@ -1,4 +1,4 @@
-from numpy import complex128, float64, int32
+from numpy import complex128, float64, int32, ones, r_
 from numpy.core.multiarray import zeros, empty, array
 from scipy.sparse import csr_matrix as sparse, vstack, hstack
 
@@ -16,7 +16,7 @@ def _create_J_with_numba(Ybus, V, pvpq, pq, createJ, pvpq_lookup, npv, npq):
     Ibus = zeros(len(V), dtype=complex128)
     # create Jacobian from fast calc of dS_dV
     dVm_x, dVa_x = dSbus_dV_numba_sparse(Ybus.data, Ybus.indptr, Ybus.indices, V, V / abs(V), Ibus)
-
+    # todo: initialize J also for extra column and extra row, for the rows where slack_weight != 0
     # data in J, space preallocated is bigger than acutal Jx -> will be reduced later on
     Jx = empty(len(dVm_x) * 4, dtype=float64)
     # row pointer, dimension = pvpq.shape[0] + pq.shape[0] + 1
@@ -38,20 +38,37 @@ def _create_J_with_numba(Ybus, V, pvpq, pq, createJ, pvpq_lookup, npv, npq):
     return J
 
 
-def _create_J_without_numba(Ybus, V, pvpq, pq):
+def _create_J_without_numba(Ybus, V, ref, pvpq, pq, slack_weights, dist_slack):
     # create Jacobian with standard pypower implementation.
     dS_dVm, dS_dVa = dSbus_dV(Ybus, V)
 
     ## evaluate Jacobian
-    J11 = dS_dVa[array([pvpq]).T, pvpq].real
-    J12 = dS_dVm[array([pvpq]).T, pq].real
-    if len(pq) > 0:
-        J21 = dS_dVa[array([pq]).T, pvpq].imag
+
+    if dist_slack:
+        rows_pvpq = array(r_[ref, pvpq]).T
+        cols_pvpq = r_[ref[1:], pvpq]
+        J11 = dS_dVa[rows_pvpq, :][:, cols_pvpq].real
+        J12 = dS_dVm[rows_pvpq, :][:, pq].real
+    else:
+        rows_pvpq = array([pvpq]).T
+        cols_pvpq = pvpq
+        J11 = dS_dVa[rows_pvpq, cols_pvpq].real
+        J12 = dS_dVm[rows_pvpq, pq].real
+    if len(pq) > 0 or dist_slack:
+        J21 = dS_dVa[array([pq]).T, cols_pvpq].imag
         J22 = dS_dVm[array([pq]).T, pq].imag
-        J = vstack([
-            hstack([J11, J12]),
-            hstack([J21, J22])
-        ], format="csr")
+        if dist_slack:
+            J13 = sparse(slack_weights.reshape(-1,1))
+            J23 = sparse(zeros(shape=(len(pq), 1)))
+            J = vstack([
+                hstack([J11, J12, J13]),
+                hstack([J21, J22, J23])
+            ], format="csr")
+        else:
+            J = vstack([
+                hstack([J11, J12]),
+                hstack([J21, J22])
+            ], format="csr")
     else:
         J = vstack([
             hstack([J11, J12])
@@ -59,15 +76,15 @@ def _create_J_without_numba(Ybus, V, pvpq, pq):
     return J
 
 
-def create_jacobian_matrix(Ybus, V, pvpq, pq, createJ, pvpq_lookup, npv, npq, numba):
+def create_jacobian_matrix(Ybus, V, ref, pvpq, pq, createJ, pvpq_lookup, npv, npq, numba, slack_weights, dist_slack):
     if numba:
         J = _create_J_with_numba(Ybus, V, pvpq, pq, createJ, pvpq_lookup, npv, npq)
     else:
-        J = _create_J_without_numba(Ybus, V, pvpq, pq)
+        J = _create_J_without_numba(Ybus, V, ref, pvpq, pq, slack_weights, dist_slack)
     return J
 
 
-def get_fastest_jacobian_function(pvpq, pq, numba):
+def get_fastest_jacobian_function(pvpq, pq, numba, dist_slack):
     if numba:
         if len(pvpq) == len(pq):
             create_jacobian = create_J2

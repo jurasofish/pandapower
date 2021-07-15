@@ -4,7 +4,7 @@
 # Use of this source code is governed by a BSD-style
 # license that can be found in the LICENSE file.
 
-# Copyright (c) 2016-2020 by University of Kassel and Fraunhofer Institute for Energy Economics
+# Copyright (c) 2016-2021 by University of Kassel and Fraunhofer Institute for Energy Economics
 # and Energy System Technology (IEE), Kassel. All rights reserved.
 
 
@@ -17,7 +17,7 @@ from scipy.sparse import csr_matrix
 
 from pandapower.pypower.idx_brch import F_BUS, T_BUS, BR_STATUS, PF, PT, QF, QT
 from pandapower.pypower.idx_bus import VM, VA, PD, QD
-from pandapower.pypower.idx_gen import GEN_BUS, GEN_STATUS, PG, QG, QMIN, QMAX
+from pandapower.pypower.idx_gen import GEN_BUS, GEN_STATUS, PG, QG, QMIN, QMAX, SL_FAC
 
 EPS = finfo(float).eps
 
@@ -79,7 +79,13 @@ def _update_p(baseMVA, bus, gen, ref, gbus, on, Sbus, ref_gens):
             ext_grids = intersect1d(gens_at_bus, ref_gens)
             pv_gens = setdiff1d(gens_at_bus, ext_grids)
             p_ext_grids = p_bus - sum(gen[pv_gens, PG])
-            gen[ext_grids, PG] = p_ext_grids / len(ext_grids)
+            slack_weights = gen[ext_grids, SL_FAC]
+            sum_slack_weights = sum(slack_weights)
+            if sum_slack_weights > 0:
+                # distribute bus slack power according to the distributed slack contribution factors
+                gen[ext_grids, PG] = gen[ext_grids, PG] + (p_ext_grids - sum(gen[ext_grids, PG])) * slack_weights / sum_slack_weights
+            else:
+                gen[ext_grids, PG] = p_ext_grids / len(ext_grids)
         else:
             gen[on[gens_at_bus[0]], PG] = p_bus
 
